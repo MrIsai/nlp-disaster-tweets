@@ -1,0 +1,272 @@
+---
+title: "NLP Disaster Tweets"
+output: html_notebook
+---
+Erwin Isai Pashel Estrada   
+Fernando Jose Sagastume   
+Jose Miguel Hernandez   
+
+***   
+
+```{r echo=FALSE}
+#install.packages("readr")
+#install.packages("dplyr")
+#install.packages("tm")
+#install.packages("SnowballC")
+#install.packages("randomForest")
+#install.packages("caretEnsemble")
+```
+
+
+## Import libraries
+```{r message=FALSE}
+library(tidyverse)
+library(stringi)
+library(tm)
+library(irlba)
+library(wordcloud)
+library(gridExtra)
+library(caret)
+library(doParallel)
+library(ggplot2)
+
+library(caretEnsemble)
+library(e1071)
+```
+***   
+
+## Load the datasets
+```{r echo=FALSE}
+train <- read.csv("train.csv", stringsAsFactors = FALSE, na.strings = c(""))
+test <- read.csv("test.csv", stringsAsFactors = FALSE, na.strings = c(""))
+submission<-read.csv("sample_submission.csv")
+head(train)
+```
+
+```{r}
+glimpse(train)
+glimpse(test)
+```
+
+
+```{r warning=FALSE, echo=FALSE}
+dataset.complete <- bind_rows(train,test)
+```
+
+```{r}
+dataset.complete$target <- as.factor(ifelse(dataset.complete$target == 1,"Yes","No"))
+summary(dataset.complete)
+```
+
+
+
+## Preparing the data for modeling
+   
+Drop the column id and show na values.
+```{r message=FALSE}
+dataset.complete$id <- NULL
+navalues <- colSums(sapply(dataset.complete, is.na))
+navalues
+```
+```{r}
+dataset.complete$TextLength <- nchar(dataset.complete$text)
+summary(dataset.complete)
+```
+
+
+```{r}
+ggplot(dataset.complete, aes(x = target, y = TextLength, fill = target))+
+  geom_boxplot() +
+  labs(x = "Target Labels", y = "Text Length")+
+  theme_classic()
+```
+
+
+### **1. Create the text corpus**  
+The variable containing text needs to be converted to a corpus for preprocessing. A corpus is a collection of documents.
+```{r message=FALSE}
+corpus <- Corpus(VectorSource(dataset.complete$text))
+```
+
+### **2. Remove the URLs**
+```{r warning=FALSE,message=FALSE}
+removeURL <- function(x) gsub("http[^[:space:]]*", "", x)  
+corpus <- tm_map(corpus, content_transformer(removeURL))
+inspect(corpus[[400]])
+```
+
+### **3. Transform to lowercase**
+The model needs to treat Words like 'soft' and 'Soft' as same. Hence, all the words are converted to lowercase with the lines of code below.
+```{r warning=FALSE,message=FALSE}
+corpus <- tm_map(corpus,PlainTextDocument)
+corpus <- tm_map(corpus,tolower)
+inspect(corpus[[400]])
+```
+
+### **4. Removing punctuation**
+The idea here is to remove everything that isn't a standard number or letter.
+```{r warning=FALSE}
+corpus <- tm_map(corpus,removePunctuation)
+```
+
+### **5. Removing usernames**
+```{r warning=FALSE}
+removeUsername <- function(x) gsub("@[^[:space:]]*", "", x)  
+corpus <- tm_map(corpus, content_transformer(removeUsername))
+inspect(corpus[[400]])
+```
+
+### **6. Removing all except spaces and english language**
+```{r warning=FALSE}
+removeNumPunct <- function(x) gsub("[^[:alpha:][:space:]]*", "", x)   
+corpus <- tm_map(corpus, content_transformer(removeNumPunct))
+inspect(corpus[[400]])
+```
+
+### **7. Removing stopwords**
+```{r warning=FALSE}
+vectorStopWords <- c("really", "tweets", "saw", "just", "feel", "may", "us", "rt", "every", "one", "amp", "like", "will", "got", "new", "can", "still", "back", "top", "much", "near", "im", "see", "via", "get", "now", "come", "oil", "let", "god", "want", "pm", "last", "hope", "since", "everyone", "food", "content", "always", "th", "full", "found", "dont", "look", "cant", "mh", "lol", "set", "old", "service", "city", "home", "live", "night", "news", "say", "video", "people", "ill", "way",  "please", "years", "take", "homes", "read", "man", "next", "cross", "boy", "bad", "ass")
+stopWords <- c(vectorStopWords,stopwords('english'))
+corpus <- tm_map(corpus, removeWords, stopWords) 
+inspect(corpus[[400]])
+```
+
+### **8. Removing single letter words**
+```{r warning=FALSE}
+removeSingle <- function(x) gsub(" . ", " ", x)   
+corpus <- tm_map(corpus, content_transformer(removeSingle))
+inspect(corpus[[400]])
+```
+
+### **9. Removing extra spaces**
+```{r warning=FALSE}
+corpus <- tm_map(corpus,stripWhitespace)
+inspect(corpus[[400]])
+```
+
+```{r}
+dataset.tdm <- TermDocumentMatrix(corpus,control = list(wordLengths=c(4,Inf)))
+```
+
+```{r}
+complete.term.matrix <- as.matrix(t(dataset.tdm))
+complete.term.matrix[1:10, 1:20]
+```
+
+
+```{r}
+dim(complete.term.matrix)
+```
+We can see that have 10876 tweets and 19965 terms within of the tweets.
+
+## Feature extraction with **Singular Value Decomposition (SVD)**
+
+```{r}
+incomplete.cases <- which(!complete.cases(complete.term.matrix))
+complete.term.matrix[incomplete.cases,] <- rep(0.0, ncol(complete.term.matrix))
+```
+
+```{r}
+complete_irlba <- irlba(t(complete.term.matrix), nv = 150, maxit = 600)
+```
+
+## Build the dataset train and test
+We used the dataset with feature extraction to build the datasets.
+```{r}
+dataset.svd <- data.frame(target=dataset.complete$target,textLength=dataset.complete$TextLength,complete_irlba$v)
+
+dataset.train <- dataset.svd[1:7613,]
+dataset.test  <- dataset.svd[7614:10876,-1]
+
+dim(dataset.test)
+```
+
+```{r}
+names(dataset.train) <- make.names(names(dataset.train))
+names(dataset.test)  <- make.names(names(dataset.test))
+```
+
+
+```{r}
+head(dataset.train)
+```
+
+
+## Multifolds & TrainControl
+```{r}
+set.seed(1985)
+cv.folds <- createMultiFolds(dataset.train$target, k = 10, times = 5)
+```
+
+```{r}
+cv.cntrl <- trainControl(method = "repeatedcv", number = 10, repeats = 10, 
+                         index = cv.folds, 
+                         summaryFunction = twoClassSummary, 
+                         classProbs = TRUE,
+                         allowParallel = TRUE, 
+                         savePredictions = TRUE)
+```
+
+
+```{r}
+cl <- makeCluster(3)
+registerDoParallel(cl)
+getDoParWorkers()
+```
+
+## Training the model
+```{r}
+set.seed(1998)
+models <- c("glmnet", "rf", "gbm", "bayesglm", "svmRadial")
+model_list <- caretList(target ~ ., data = dataset.train,
+                        trControl = cv.cntrl, 
+                        methodList = models,
+                        tuneList = NULL, 
+                        continue_on_fail = FALSE)
+#model_list <- svm(target~., data=dataset.train, kernel = "radial")
+```
+
+```{r}
+stacking_results <- resamples(model_list)
+summary(stacking_results)
+```
+
+
+The ROC curve is useful to see the results of train step
+```{r}
+set.seed(1998)
+ensemble_1 <- caretStack(model_list, method = "glmnet",
+                         metric = "ROC", 
+                         trControl = cv.cntrl)
+ensemble_1
+```
+
+```{r}
+stopCluster(cl)
+```
+
+## Predicting
+```{r}
+pred <- predict(ensemble_1, dataset.test, type = "raw")
+```
+
+```{r}
+submission$target <- ifelse(pred == "Yes",1,0)
+head(submission)
+```
+
+```{r}
+train.copy <- train
+train.copy$keyword <- train.copy$keyword %>% replace_na('None')
+
+ag <- aggregate(x=train.copy[, c("keyword")], 
+                by=list(Text = train.copy$text), 
+                FUN = sum)
+summary(ag)
+```
+
+
+```{r}
+write.csv(submission,"submission.csv",row.names = FALSE)
+```
+
